@@ -4,8 +4,9 @@ import unittest
 import io
 import zipfile
 from datetime import date
+from unittest.mock import patch
 
-from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow, train_paths
+from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow, train_paths, build_station_catalog
 
 
 class ImporterTests(unittest.TestCase):
@@ -64,6 +65,19 @@ class ImporterTests(unittest.TestCase):
             paths, names = train_paths(z, {'t1': ('KM',['93482'],'daily')}, {'daily': {'2026-11-25'}})
         self.assertEqual(paths['2026-11-25']['KM']['93482'], ['h','w','l'])
         self.assertEqual(names['w'], 'Warszawa Zachodnia')
+
+    def test_catalog_contains_only_stations_served_by_km_or_skm(self):
+        stops = {str(n): f'Przystanek {n}' for n in range(1, 24)}
+        csv_data = 'name;country;uic\n' + ''.join(
+            f'Przystanek {n};PL;{5100000+n}\n' for n in range(1, 24)
+        ) + 'Kraków Osobny;PL;5109999\nObca Stacja;DE;8000001\n'
+        with patch('update_data.get', return_value=csv_data.encode()):
+            stations = build_station_catalog(stops)
+        names = {s['name'] for s in stations}
+        self.assertIn('Przystanek 17', names)
+        self.assertIn('Halinów', names)
+        self.assertNotIn('Kraków Osobny', names)
+        self.assertNotIn('Obca Stacja', names)
 
 
 if __name__ == '__main__':
