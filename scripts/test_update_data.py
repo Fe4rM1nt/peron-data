@@ -5,7 +5,7 @@ import io
 import zipfile
 from datetime import date
 
-from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow
+from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow, train_paths
 
 
 class ImporterTests(unittest.TestCase):
@@ -53,6 +53,17 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(result['2026-11-25']['KM']['93482'], 'west')
         self.assertEqual(result['2026-11-25']['KM']['19813'], 'east')
         self.assertNotIn('99999', result['2026-11-25']['KM'])
+
+    def test_station_paths_resolve_next_stop_at_any_station(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as z:
+            z.writestr('stops.txt', 'stop_id,stop_name,parent_station\nh,Halinów,\nw,Warszawa Zachodnia,\np1,Peron 1,h\np2,Peron 2,w\nl,Łowicz Główny,\n')
+            z.writestr('stop_times.txt', 'trip_id,stop_id,stop_sequence\nt1,p1,1\nt1,p2,2\nt1,l,3\n')
+        data.seek(0)
+        with zipfile.ZipFile(data) as z:
+            paths, names = train_paths(z, {'t1': ('KM',['93482'],'daily')}, {'daily': {'2026-11-25'}})
+        self.assertEqual(paths['2026-11-25']['KM']['93482'], ['h','w','l'])
+        self.assertEqual(names['w'], 'Warszawa Zachodnia')
 
 
 if __name__ == '__main__':
