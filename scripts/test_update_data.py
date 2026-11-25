@@ -1,9 +1,11 @@
 """Offline tests for number, term and stock matching."""
 
 import unittest
+import io
+import zipfile
 from datetime import date
 
-from update_data import parse_period, stock_name, term_dates, train_numbers
+from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow
 
 
 class ImporterTests(unittest.TestCase):
@@ -37,6 +39,20 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(stock_name('EN57AKMw1', '2'), '2 × EN57AKM')
         self.assertEqual(stock_name('ER160', '2'), '2 × ER160 FLIRT')
         self.assertEqual(stock_name('EU47, P, B, Bs', '1, 3, 1, 1'), 'EU47 + 5 wagonów piętrowych')
+
+    def test_direction_uses_next_stop_not_final_destination(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as z:
+            z.writestr('stops.txt', 'stop_id,stop_name,stop_lon\nh,Halinów,21.354\nw,Sulejówek Miłosna,21.290\ne,Dębe Wielkie,21.436\n')
+            z.writestr('stop_times.txt', 'trip_id,stop_id,stop_sequence\nt1,h,5\nt1,w,6\nt2,h,3\nt2,e,4\nt3,h,2\nt3,w,3\nt4,h,2\nt4,e,3\n')
+        data.seek(0)
+        trips = {'t1': ('KM', ['93482'], 'daily'), 't2': ('KM', ['19813'], 'daily'),
+                 't3': ('KM', ['99999'], 'daily'), 't4': ('KM', ['99999'], 'daily')}
+        with zipfile.ZipFile(data) as z:
+            result = train_directions_at_halinow(z, trips, {'daily': {'2026-11-25'}})
+        self.assertEqual(result['2026-11-25']['KM']['93482'], 'west')
+        self.assertEqual(result['2026-11-25']['KM']['19813'], 'east')
+        self.assertNotIn('99999', result['2026-11-25']['KM'])
 
 
 if __name__ == '__main__':
