@@ -79,20 +79,28 @@ class ImporterTests(unittest.TestCase):
         data = io.BytesIO()
         with zipfile.ZipFile(data, 'w') as z:
             z.writestr('stops.txt', 'stop_id,stop_name,parent_station,stop_lon\nh,Halinów,,21.354\nw,Sulejówek Miłosna,,21.290\nl,Łowicz Główny,,20.200\np1,Peron 1,h,21.354\n')
-            z.writestr('stop_times.txt', 'trip_id,stop_id,stop_sequence,departure_time,platform_code\nt1,p1,1,15:10:00,II\nt1,w,2,15:20:00,I\nt1,l,3,16:55:00,I\n')
+            z.writestr('stop_times.txt', 'trip_id,stop_id,stop_sequence,arrival_time,departure_time,platform_code\nt1,p1,1,15:09:00,15:10:00,II\nt1,w,2,15:19:00,15:20:00,I\nt1,l,3,16:55:00,16:55:00,I\n')
         data.seek(0)
         with zipfile.ZipFile(data) as z:
             boards = gtfs_station_boards(z, {'t1': ('KM', ['93482'], 'daily')},
                                           {'t1': 'R3'}, {'daily': {'2026-11-25'}},
                                           {'h': 'Halinów', 'w': 'Sulejówek Miłosna', 'l': 'Łowicz Główny'},
                                           date(2026, 11, 25))
-        train = boards['h']['2026-11-25'][0]
+        train = boards['h']['departures']['2026-11-25'][0]
         self.assertEqual(train['trainCode'], 'KM 93482')
         self.assertEqual(train['nextStop'], 'Sulejówek Miłosna')
         self.assertEqual(train['arrivalStation'], 'Łowicz Główny')
         self.assertEqual(train['direction'], 'west')
         self.assertEqual(train['platform'], 'II')
-        self.assertNotIn('l', boards)  # Destination has no departure.
+        arrival = boards['l']['arrivals']['2026-11-25'][0]
+        self.assertEqual(arrival['trainCode'], 'KM 93482')
+        self.assertEqual(arrival['originStation'], 'Halinów')
+        self.assertEqual(arrival['prevStop'], 'Sulejówek Miłosna')
+        self.assertTrue(arrival['terminates'])
+        self.assertNotIn('2026-11-25', boards['l']['departures'])
+        intermediate = boards['w']['arrivals']['2026-11-25'][0]
+        self.assertFalse(intermediate['terminates'])
+        self.assertEqual(intermediate['prevStop'], 'Halinów')
 
 
 if __name__ == '__main__':

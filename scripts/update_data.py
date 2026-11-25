@@ -240,7 +240,7 @@ def gtfs_station_boards(z: zipfile.ZipFile, trips: dict, trip_lines: dict, servi
             continue
         rows_by_trip[trip_id].append((sequence, row))
 
-    boards = defaultdict(lambda: defaultdict(list))
+    boards = defaultdict(lambda: {"departures": defaultdict(list), "arrivals": defaultdict(list)})
     last_day = (today + timedelta(days=horizon - 1)).isoformat()
     tz = ZoneInfo("Europe/Warsaw")
     for trip_id, rows in rows_by_trip.items():
@@ -262,38 +262,62 @@ def gtfs_station_boards(z: zipfile.ZipFile, trips: dict, trip_lines: dict, servi
         destination = stop_names.get(route[-1][2], "")
         if not destination:
             continue
-        for (seq, row, station_id), (_, _, next_id) in zip(route, route[1:]):
-            if station_id not in stop_names or next_id not in stop_names:
+        origin = stop_names.get(route[0][2], "")
+        for position, (seq, row, station_id) in enumerate(route):
+            if station_id not in stop_names:
                 continue
-            scheduled = (row.get("departure_time") or "").strip()
-            m = re.fullmatch(r"(\d{1,2}):(\d{2}):(\d{2})", scheduled)
-            if not m:
-                continue
-            seconds = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])
-            # Only allow plausible GTFS time values, including post-midnight 24+.
-            if seconds >= 48 * 3600 or int(m[2]) > 59 or int(m[3]) > 59:
-                continue
-            direction = None
-            if station_key(stop_names[station_id]) == "halinow":
-                delta = longitudes.get(next_id, 0) - longitudes.get(station_id, 0)
-                if abs(delta) > .005:
-                    direction = "east" if delta > 0 else "west"
-            for day in dates:
-                start = datetime.combine(date.fromisoformat(day), time.min, tzinfo=tz)
-                timestamp = int((start + timedelta(seconds=seconds)).timestamp())
-                data = {"trainCode": trip_carrier + " " + numbers[0],
-                        "timestamp": timestamp, "calculatedTime": timestamp,
-                        "arrivalStation": destination, "currentStation": stop_names[station_id],
-                        "nextStop": stop_names[next_id], "line": trip_lines[trip_id],
-                        "tripId": trip_id, "serviceDay": day,
-                        "stopId": row["stop_id"], "stopSequence": seq,
-                        "trainNumber": numbers[0], "carrier": trip_carrier,
-                        "platform": row.get("platform_code") or "", "track": ""}
-                if direction:
-                    data["direction"] = direction
-                boards[station_id][day].append(data)
-    return {station: {day: sorted(departures, key=lambda t: t["timestamp"])
-                      for day, departures in days.items()} for station, days in boards.items()}
+            events = []
+            if position < len(route) - 1:
+                events.append(("departures", route[position + 1][2], "departure_time"))
+            if position > 0:
+                events.append(("arrivals", route[position - 1][2], "arrival_time"))
+            for kind, adjacent_id, time_field in events:
+                if adjacent_id not in stop_names:
+                    continue
+                scheduled = (row.get(time_field) or "").strip()
+                m = re.fullmatch(r"(\d{1,2}):(\d{2}):(\d{2})", scheduled)
+                if not m:
+                    continue
+                seconds = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])
+                if seconds >= 48 * 3600 or int(m[2]) > 59 or int(m[3]) > 59:
+                    continue
+                direction = None
+                if station_key(stop_names[station_id]) == "halinow":
+                    if kind == "departures":
+                        delta = longitudes.get(adjacent_id, 0) - longitudes.get(station_id, 0)
+                    else:
+                        delta = longitudes.get(station_id, 0) - longitudes.get(adjacent_id, 0)
+                    if abs(delta) > .005:
+                        direction = "east" if delta > 0 else "west"
+                for day in dates:
+                    start = datetime.combine(date.fromisoformat(day), time.min, tzinfo=tz)
+                    timestamp = int((start + timedelta(seconds=seconds)).timestamp())
+                    data = {"trainCode": trip_carrier + " " + numbers[0],
+                            "timestamp": timestamp, "calculatedTime": timestamp,
+                            "currentStation": stop_names[station_id],
+                            "line": trip_lines[trip_id], "tripId": trip_id,
+                            "serviceDay": day, "stopId": row["stop_id"],
+                            "stopSequence": seq, "trainNumber": numbers[0],
+                            "carrier": trip_carrier,
+                            "platform": row.get("platform_code") or "", "track": ""}
+                    if kind == "departures":
+                        data["arrivalStation"] = destination
+                        data["nextStop"] = stop_names[adjacent_id]
+                    else:
+                        data["originStation"] = origin
+                        data["prevStop"] = stop_names[adjacent_id]
+                        data["terminates"] = position == len(route) - 1
+                    if direction:
+                        data["direction"] = direction
+                    boards[station_id][kind][day].append(data)
+    return {
+        station: {
+            kind: {
+                day: sorted(trains, key=lambda t: t["timestamp"])
+                for day, trains in days.items()
+            } for kind, days in sections.items()
+        } for station, sections in boards.items()
+    }
 
 
 def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict, dict]:
@@ -533,7 +557,7 @@ def main():
     if line_count < 100 or direction_count < 50 or stock_count < 50:
         raise RuntimeError("Importer generated too few records; leaving previous JSON untouched")
     hal_ids = [s["id"][5:] for s in stations if station_key(s["name"]) == "halinow"]
-    if not any(len(boards.get(sid, {}).get(today.isoformat(), [])) > 10 for sid in hal_ids):
+    if not any(len(boards.get(sid, {}).get("departures", {}).get(today.isoformat(), [])) > 10 for sid in hal_ids):
         raise RuntimeError("Importer generated no useful Halinów departures; retaining previous data")
     payload = {"schema": 1, "generatedAt": datetime.now(timezone.utc).isoformat(),
                "validUntil": (today + timedelta(days=43)).isoformat(),
@@ -546,17 +570,20 @@ def main():
     tmp.replace(OUTPUT)
     STATIONS_OUTPUT.write_text(json.dumps({"generatedAt": payload["generatedAt"], "stations": stations}, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     BOARD_DIR.mkdir(parents=True, exist_ok=True)
-    for stop_id, days in boards.items():
+    for stop_id, sections in boards.items():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,30}", stop_id):
             continue
-        for departures in days.values():
-            for train in departures:
-                stock_record = stock.get(train["serviceDay"], {}).get(train["trainNumber"])
-                if train["carrier"] == "KM" and stock_record:
-                    train["stock"] = stock_record["stock"]
+        for days in sections.values():
+            for scheduled in days.values():
+                for train in scheduled:
+                    stock_record = stock.get(train["serviceDay"], {}).get(train["trainNumber"])
+                    if train["carrier"] == "KM" and stock_record:
+                        train["stock"] = stock_record["stock"]
         (BOARD_DIR / (stop_id + ".json")).write_text(
             json.dumps({"generatedAt": payload["generatedAt"], "stationId": stop_id,
-                        "name": stop_names[stop_id], "days": days}, ensure_ascii=False, separators=(",", ":")),
+                        "name": stop_names[stop_id],
+                        "days": sections["departures"], "arrivals": sections["arrivals"]},
+                       ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8")
     print(f"Saved {len(boards)} station boards and {len(stations)} KM/SKM stations")
     print(f"Saved {OUTPUT} ({OUTPUT.stat().st_size} bytes)")
