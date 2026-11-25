@@ -174,6 +174,7 @@ def train_paths(z: zipfile.ZipFile, trips: dict, services: dict) -> tuple[dict, 
         paths_by_trip[trip_id].append((sequence, parents[row["stop_id"]]))
 
     choices = defaultdict(set)
+    served_ids = set()
     for trip_id, entries in paths_by_trip.items():
         path = []
         for _, station in sorted(entries):
@@ -181,19 +182,18 @@ def train_paths(z: zipfile.ZipFile, trips: dict, services: dict) -> tuple[dict, 
                 path.append(station)
         if len(path) < 2:
             continue
+        served_ids.update(path)
         carrier, numbers, service_id = trips[trip_id]
         for day in services.get(service_id, ()):
             for number in numbers:
                 choices[(day, carrier, number)].add(tuple(path))
 
     routes = defaultdict(lambda: defaultdict(dict))
-    used_ids = set()
     for (day, carrier, number), alternatives in choices.items():
         if len(alternatives) == 1:
             path = next(iter(alternatives))
             routes[day][carrier][number] = list(path)
-            used_ids.update(path)
-    stop_names = {station: names[station] for station in used_ids if station in names}
+    stop_names = {station: names[station] for station in served_ids if station in names}
     return {day: dict(carriers) for day, carriers in routes.items()}, stop_names
 
 
