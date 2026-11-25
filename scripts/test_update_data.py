@@ -4,9 +4,8 @@ import unittest
 import io
 import zipfile
 from datetime import date
-from unittest.mock import patch
 
-from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow, train_paths, build_station_catalog
+from update_data import parse_period, stock_name, term_dates, train_numbers, train_directions_at_halinow, train_paths, build_station_catalog, gtfs_station_boards
 
 
 class ImporterTests(unittest.TestCase):
@@ -67,17 +66,33 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(names['w'], 'Warszawa Zachodnia')
 
     def test_catalog_contains_only_stations_served_by_km_or_skm(self):
-        stops = {str(n): f'Przystanek {n}' for n in range(1, 24)}
-        csv_data = 'name;country;uic\n' + ''.join(
-            f'Przystanek {n};PL;{5100000+n}\n' for n in range(1, 24)
-        ) + 'Kraków Osobny;PL;5109999\nObca Stacja;DE;8000001\n'
-        with patch('update_data.get', return_value=csv_data.encode()):
-            stations = build_station_catalog(stops)
+        stops = {str(n): f'Przystanek {n}' for n in range(1, 90)}
+        stops['hal'] = 'Halinów'
+        stations = build_station_catalog(stops)
         names = {s['name'] for s in stations}
         self.assertIn('Przystanek 17', names)
         self.assertIn('Halinów', names)
-        self.assertNotIn('Kraków Osobny', names)
-        self.assertNotIn('Obca Stacja', names)
+        self.assertEqual(next(s['id'] for s in stations if s['name']=='Przystanek 17'), 'gtfs:17')
+        self.assertNotIn('Przypadkowa Stacja', names)
+
+    def test_gtfs_boards_include_only_serviced_stops_with_correct_direction(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, 'w') as z:
+            z.writestr('stops.txt', 'stop_id,stop_name,parent_station,stop_lon\nh,Halinów,,21.354\nw,Sulejówek Miłosna,,21.290\nl,Łowicz Główny,,20.200\np1,Peron 1,h,21.354\n')
+            z.writestr('stop_times.txt', 'trip_id,stop_id,stop_sequence,departure_time,platform_code\nt1,p1,1,15:10:00,II\nt1,w,2,15:20:00,I\nt1,l,3,16:55:00,I\n')
+        data.seek(0)
+        with zipfile.ZipFile(data) as z:
+            boards = gtfs_station_boards(z, {'t1': ('KM', ['93482'], 'daily')},
+                                          {'t1': 'R3'}, {'daily': {'2026-11-25'}},
+                                          {'h': 'Halinów', 'w': 'Sulejówek Miłosna', 'l': 'Łowicz Główny'},
+                                          date(2026, 11, 25))
+        train = boards['h']['2026-11-25'][0]
+        self.assertEqual(train['trainCode'], 'KM 93482')
+        self.assertEqual(train['nextStop'], 'Sulejówek Miłosna')
+        self.assertEqual(train['arrivalStation'], 'Łowicz Główny')
+        self.assertEqual(train['direction'], 'west')
+        self.assertEqual(train['platform'], 'II')
+        self.assertNotIn('l', boards)  # Destination has no departure.
 
 
 if __name__ == '__main__':
