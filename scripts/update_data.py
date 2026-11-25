@@ -76,6 +76,11 @@ def plain_name(value: str) -> str:
                    if not unicodedata.combining(c))
 
 
+def station_key(value: str) -> str:
+    """A conservative comparison between GTFS and UIC catalog station names."""
+    return re.sub(r"[^a-z0-9]", "", plain_name(value))
+
+
 def train_directions_at_halinow(z: zipfile.ZipFile, trips: dict, services: dict) -> dict:
     """Use the NEXT station in GTFS, never the final destination, for direction.
 
@@ -190,27 +195,31 @@ def train_paths(z: zipfile.ZipFile, trips: dict, services: dict) -> tuple[dict, 
     return {day: dict(carriers) for day, carriers in routes.items()}, stop_names
 
 
-def build_station_catalog() -> list[dict]:
+def build_station_catalog(stop_names: dict[str, str]) -> list[dict]:
     """UIC station IDs from an independent public station catalog.
 
     These codes are also used by Bilkom's board API. The catalog is not
     guaranteed to cover every small Polish halt, so the Site also offers
     direct Bilkom URL selection when a station is absent.
     """
+    served = {station_key(name) for name in stop_names.values() if station_key(name)}
     try:
         rows = csv.DictReader(io.StringIO(get(STATION_CATALOG).decode("utf-8-sig")), delimiter=";")
-        result = {"5101343": "Halinów"}
+        result = {}
         for row in rows:
             code = (row.get("uic") or "").strip()
             if row.get("country", "").upper() != "PL" or not re.fullmatch(r"51\d{5}", code):
                 continue
             name = (row.get("name") or "").strip()
-            if name:
+            if name and station_key(name) in served:
                 result.setdefault(code, name)
+        # This is the original station. Keep it even if a catalog renames it.
+        result["5101343"] = "Halinów"
+        if len(result) < 20:
+            raise RuntimeError("Too few KM/SKM stations matched the UIC catalog")
         return [{"id": code, "name": name} for code, name in sorted(result.items(), key=lambda x: plain_name(x[1]))]
     except Exception as exc:
-        print(f"Notice: UIC station catalog unavailable: {exc}", file=sys.stderr)
-        return [{"id": "5101343", "name": "Halinów"}]
+        raise RuntimeError("KM/SKM station catalog unavailable; preserving previous data") from exc
 
 
 def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict]:
@@ -437,7 +446,7 @@ def build_stock(today: date, horizon=43) -> tuple[dict[str, dict[str, dict]], li
 def main():
     today = datetime.now(timezone.utc).date()
     lines, directions, paths, stop_names = build_gtfs(today)
-    stations = build_station_catalog()
+    stations = build_station_catalog(stop_names)
     stock, sources = build_stock(today)
     line_count = sum(len(rows) for carriers in lines.values() for rows in carriers.values())
     direction_count = sum(len(rows) for carriers in directions.values() for rows in carriers.values())
