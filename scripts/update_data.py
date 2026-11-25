@@ -14,10 +14,11 @@ import re
 import sys
 import zipfile
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
 from pathlib import Path
 import unicodedata
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse
 
 import holidays
@@ -27,8 +28,9 @@ from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "peron.json"
+BOARD_DIR = ROOT / "data" / "boards"
+STATIONS_OUTPUT = ROOT / "data" / "stations.json"
 GTFS = "https://mkuran.pl/gtfs/polish_trains.zip"
-STATION_CATALOG = "https://raw.githubusercontent.com/trainline-eu/stations/master/stations.csv"
 KM_INDEX = "https://www.mazowieckie.com.pl/pl/rozklad-jazdy"
 KM_PREV = "https://www.mazowieckie.com.pl/pl/podstawowe-informacje/rozklad-jazdy-pociagow-km-wazny-w-dniach-25-x-12-xii-2026r"
 KM_NEXT = "https://www.mazowieckie.com.pl/pl/podstawowe-informacje/rozklad-jazdy-pociagow-km-wazny-w-dniach-13-xii-2026r-13-iii-2027r"
@@ -196,33 +198,105 @@ def train_paths(z: zipfile.ZipFile, trips: dict, services: dict) -> tuple[dict, 
 
 
 def build_station_catalog(stop_names: dict[str, str]) -> list[dict]:
-    """UIC station IDs from an independent public station catalog.
+    """Every station used by KM/SKM, keyed by the *same GTFS stop ID* as schedules.
 
-    These codes are also used by Bilkom's board API. The catalog is not
-    guaranteed to cover every small Polish halt, so the Site also offers
-    direct Bilkom URL selection when a station is absent.
+    Bilkom and third-party UIC identifiers are not interchangeable. Never
+    attach an unverified external ID to a station.
     """
-    served = {station_key(name) for name in stop_names.values() if station_key(name)}
-    try:
-        rows = csv.DictReader(io.StringIO(get(STATION_CATALOG).decode("utf-8-sig")), delimiter=";")
-        result = {}
-        for row in rows:
-            code = (row.get("uic") or "").strip()
-            if row.get("country", "").upper() != "PL" or not re.fullmatch(r"51\d{5}", code):
+    stations = []
+    for stop_id, name in stop_names.items():
+        if re.fullmatch(r"[a-zA-Z0-9_-]{1,30}", stop_id) and name:
+            stations.append({"id": "gtfs:" + stop_id, "name": name})
+    stations.sort(key=lambda s: (station_key(s["name"]), s["id"]))
+    if len(stations) < 80 or not any(station_key(s["name"]) == "halinow" for s in stations):
+        raise RuntimeError("GTFS contains too few KM/SKM stations; leaving prior catalog")
+    return stations
+
+
+def gtfs_station_boards(z: zipfile.ZipFile, trips: dict, trip_lines: dict, services: dict,
+                        stop_names: dict[str, str], today: date, horizon=4) -> dict:
+    """Generate compact, per-station GTFS departures for the next few days.
+
+    This is an independently usable schedule when Bilkom times out. Live
+    delays are layered on top by the Site and are never fabricated as zeros.
+    """
+    stops = csv_rows(z, "stops.txt")
+    parents = {row["stop_id"]: row.get("parent_station") or row["stop_id"]
+               for row in stops if row.get("stop_id")}
+    longitudes = {}
+    for row in stops:
+        try:
+            longitudes[row["stop_id"]] = float(row["stop_lon"])
+        except (ValueError, KeyError, TypeError):
+            pass
+    rows_by_trip = defaultdict(list)
+    for row in csv_rows(z, "stop_times.txt"):
+        trip_id = row.get("trip_id", "")
+        if trip_id not in trips or row.get("stop_id") not in parents:
+            continue
+        try:
+            sequence = int(row["stop_sequence"])
+        except (ValueError, KeyError):
+            continue
+        rows_by_trip[trip_id].append((sequence, row))
+
+    boards = defaultdict(lambda: defaultdict(list))
+    last_day = (today + timedelta(days=horizon - 1)).isoformat()
+    tz = ZoneInfo("Europe/Warsaw")
+    for trip_id, rows in rows_by_trip.items():
+        trip_carrier, numbers, service_id = trips[trip_id]
+        if not numbers:
+            continue
+        dates = [day for day in services.get(service_id, ()) if today.isoformat() <= day <= last_day]
+        if not dates:
+            continue
+        # One stop on each station: stop_times may list platforms separately.
+        route = []
+        for seq, row in sorted(rows):
+            parent = parents[row["stop_id"]]
+            if route and route[-1][2] == parent:
                 continue
-            name = (row.get("name") or "").strip()
-            if name and station_key(name) in served:
-                result.setdefault(code, name)
-        # This is the original station. Keep it even if a catalog renames it.
-        result["5101343"] = "Halinów"
-        if len(result) < 20:
-            raise RuntimeError("Too few KM/SKM stations matched the UIC catalog")
-        return [{"id": code, "name": name} for code, name in sorted(result.items(), key=lambda x: plain_name(x[1]))]
-    except Exception as exc:
-        raise RuntimeError("KM/SKM station catalog unavailable; preserving previous data") from exc
+            route.append((seq, row, parent))
+        if len(route) < 2:
+            continue
+        destination = stop_names.get(route[-1][2], "")
+        if not destination:
+            continue
+        for (seq, row, station_id), (_, _, next_id) in zip(route, route[1:]):
+            if station_id not in stop_names or next_id not in stop_names:
+                continue
+            scheduled = (row.get("departure_time") or "").strip()
+            m = re.fullmatch(r"(\d{1,2}):(\d{2}):(\d{2})", scheduled)
+            if not m:
+                continue
+            seconds = int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3])
+            # Only allow plausible GTFS time values, including post-midnight 24+.
+            if seconds >= 48 * 3600 or int(m[2]) > 59 or int(m[3]) > 59:
+                continue
+            direction = None
+            if station_key(stop_names[station_id]) == "halinow":
+                delta = longitudes.get(next_id, 0) - longitudes.get(station_id, 0)
+                if abs(delta) > .005:
+                    direction = "east" if delta > 0 else "west"
+            for day in dates:
+                start = datetime.combine(date.fromisoformat(day), time.min, tzinfo=tz)
+                timestamp = int((start + timedelta(seconds=seconds)).timestamp())
+                data = {"trainCode": trip_carrier + " " + numbers[0],
+                        "timestamp": timestamp, "calculatedTime": timestamp,
+                        "arrivalStation": destination, "currentStation": stop_names[station_id],
+                        "nextStop": stop_names[next_id], "line": trip_lines[trip_id],
+                        "tripId": trip_id, "serviceDay": day,
+                        "stopId": row["stop_id"], "stopSequence": seq,
+                        "trainNumber": numbers[0], "carrier": trip_carrier,
+                        "platform": row.get("platform_code") or "", "track": ""}
+                if direction:
+                    data["direction"] = direction
+                boards[station_id][day].append(data)
+    return {station: {day: sorted(departures, key=lambda t: t["timestamp"])
+                      for day, departures in days.items()} for station, days in boards.items()}
 
 
-def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict]:
+def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict, dict]:
     with zipfile.ZipFile(io.BytesIO(get(GTFS))) as z:
         agencies = {r.get("agency_id", ""): r.get("agency_name", "") for r in csv_rows(z, "agency.txt")}
         routes = {}
@@ -255,6 +329,7 @@ def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict]:
 
         candidates = defaultdict(set)
         known_trips = {}
+        trip_lines = {}
         for trip in csv_rows(z, "trips.txt"):
             route = routes.get(trip.get("route_id", ""))
             if not route:
@@ -264,18 +339,20 @@ def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict]:
                 continue
             carrier, line = route
             known_trips[trip["trip_id"]] = (carrier, numbers, trip.get("service_id", ""))
+            trip_lines[trip["trip_id"]] = line
             for day in services.get(trip.get("service_id", ""), ()):
                 for number in numbers:
                     candidates[(day, carrier, number)].add(line)
 
         directions = train_directions_at_halinow(z, known_trips, services)
         paths, stop_names = train_paths(z, known_trips, services)
+        boards = gtfs_station_boards(z, known_trips, trip_lines, services, stop_names, today)
 
     result = defaultdict(lambda: defaultdict(dict))
     for (day, carrier, number), lines in candidates.items():
         if len(lines) == 1:
             result[day][carrier][number] = next(iter(lines))
-    return {d: dict(by_carrier) for d, by_carrier in result.items()}, directions, paths, stop_names
+    return {d: dict(by_carrier) for d, by_carrier in result.items()}, directions, paths, stop_names, boards
 
 
 def pdf_urls() -> list[str]:
@@ -445,7 +522,7 @@ def build_stock(today: date, horizon=43) -> tuple[dict[str, dict[str, dict]], li
 
 def main():
     today = datetime.now(timezone.utc).date()
-    lines, directions, paths, stop_names = build_gtfs(today)
+    lines, directions, paths, stop_names, boards = build_gtfs(today)
     stations = build_station_catalog(stop_names)
     stock, sources = build_stock(today)
     line_count = sum(len(rows) for carriers in lines.values() for rows in carriers.values())
@@ -455,15 +532,33 @@ def main():
     print(f"GTFS: {line_count} lines, {path_count} routes, {direction_count} Halinów directions. Station catalog: {len(stations)}. KM PDF: {stock_count} stock records from {len(sources)} PDFs")
     if line_count < 100 or direction_count < 50 or stock_count < 50:
         raise RuntimeError("Importer generated too few records; leaving previous JSON untouched")
+    hal_ids = [s["id"][5:] for s in stations if station_key(s["name"]) == "halinow"]
+    if not any(len(boards.get(sid, {}).get(today.isoformat(), [])) > 10 for sid in hal_ids):
+        raise RuntimeError("Importer generated no useful Halinów departures; retaining previous data")
     payload = {"schema": 1, "generatedAt": datetime.now(timezone.utc).isoformat(),
                "validUntil": (today + timedelta(days=43)).isoformat(),
                "lines": lines, "directions": directions, "paths": paths, "stopNames": stop_names,
                "stations": stations, "stock": stock,
-               "sources": {"lines": GTFS, "directions": GTFS, "paths": GTFS, "stations": STATION_CATALOG, "stock": sources}}
+               "sources": {"lines": GTFS, "directions": GTFS, "paths": GTFS, "stations": GTFS, "stock": sources}}
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUTPUT.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(OUTPUT)
+    STATIONS_OUTPUT.write_text(json.dumps({"generatedAt": payload["generatedAt"], "stations": stations}, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    BOARD_DIR.mkdir(parents=True, exist_ok=True)
+    for stop_id, days in boards.items():
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,30}", stop_id):
+            continue
+        for departures in days.values():
+            for train in departures:
+                stock_record = stock.get(train["serviceDay"], {}).get(train["trainNumber"])
+                if train["carrier"] == "KM" and stock_record:
+                    train["stock"] = stock_record["stock"]
+        (BOARD_DIR / (stop_id + ".json")).write_text(
+            json.dumps({"generatedAt": payload["generatedAt"], "stationId": stop_id,
+                        "name": stop_names[stop_id], "days": days}, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8")
+    print(f"Saved {len(boards)} station boards and {len(stations)} KM/SKM stations")
     print(f"Saved {OUTPUT} ({OUTPUT.stat().st_size} bytes)")
 
 
