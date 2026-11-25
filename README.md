@@ -3,6 +3,7 @@
 Codzienny importer dla [Peronu](https://peron-kolej-live.fabledbench32.chatgpt.site).
 
 - **Linie**: [PolishTrainsGTFS](https://mkuran.pl/gtfs/), publiczny rozkład GTFS. Dopasowanie po numerze pociągu, przewoźniku i dacie kursowania.
+- **Kierunki w Halinowie**: z kolejności przystanków w `stop_times.txt` i długości geograficznej następnej stacji po Halinowie. Brak ręcznej listy stacji końcowych. Niepewne przypadki pozostają nieustalone.
 - **Planowany tabor KM**: [oficjalne zestawienia](https://www.mazowieckie.com.pl/pl/rozklad-jazdy). Odczyt numeru pociągu, zestawienia, liczby jednostek i dni obowiązywania.
 - **Odjazdy/opóźnienia na żywo**: pobierane oddzielnie przez Peron z Bilkom / KalkulatorKolejowy.pl.
 
