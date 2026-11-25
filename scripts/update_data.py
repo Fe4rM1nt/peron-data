@@ -17,6 +17,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
+import unicodedata
 from urllib.parse import urljoin, urlparse
 
 import holidays
@@ -69,7 +70,80 @@ def train_numbers(raw: str) -> list[str]:
     return [first, second] if first != second else [first]
 
 
-def build_gtfs(today: date, horizon=43) -> dict[str, dict[str, dict[str, str]]]:
+def plain_name(value: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", (value or "").casefold())
+                   if not unicodedata.combining(c))
+
+
+def train_directions_at_halinow(z: zipfile.ZipFile, trips: dict, services: dict) -> dict:
+    """Use the NEXT station in GTFS, never the final destination, for direction.
+
+    Halinów lies on an east-west line. The next station's longitude relative to
+    Halinów identifies the side of the platform without a destination list.
+    """
+    stops = csv_rows(z, "stops.txt")
+    halinow_ids = set()
+    longitudes = {}
+    for stop in stops:
+        stop_id = stop.get("stop_id", "")
+        try:
+            longitudes[stop_id] = float(stop["stop_lon"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if plain_name(stop.get("stop_name", "")).startswith("halinow"):
+            halinow_ids.add(stop_id)
+    if not halinow_ids:
+        raise RuntimeError("Halinów station was not found in the GTFS stops")
+
+    stop_times = csv_rows(z, "stop_times.txt")
+    station_seq = {}
+    for row in stop_times:
+        if row.get("stop_id") not in halinow_ids or row.get("trip_id") not in trips:
+            continue
+        try:
+            seq = int(row["stop_sequence"])
+        except (ValueError, KeyError):
+            continue
+        trip_id = row["trip_id"]
+        if trip_id not in station_seq or seq < station_seq[trip_id][0]:
+            station_seq[trip_id] = (seq, row["stop_id"])
+
+    next_stop = {}
+    for row in stop_times:
+        trip_id = row.get("trip_id", "")
+        origin = station_seq.get(trip_id)
+        if not origin:
+            continue
+        try:
+            seq = int(row["stop_sequence"])
+        except (ValueError, KeyError):
+            continue
+        if seq <= origin[0] or row.get("stop_id") not in longitudes or row.get("stop_id") in halinow_ids:
+            continue
+        previous = next_stop.get(trip_id)
+        if previous is None or seq < previous[0]:
+            next_stop[trip_id] = (seq, row["stop_id"])
+
+    candidates = defaultdict(set)
+    for trip_id, (_, stop_id) in next_stop.items():
+        origin = station_seq[trip_id][1]
+        delta = longitudes[stop_id] - longitudes[origin]
+        if abs(delta) < 0.005:
+            continue
+        side = "east" if delta > 0 else "west"
+        carrier, numbers, service_id = trips[trip_id]
+        for day in services.get(service_id, ()):
+            for number in numbers:
+                candidates[(day, carrier, number)].add(side)
+
+    result = defaultdict(lambda: defaultdict(dict))
+    for (day, carrier, number), sides in candidates.items():
+        if len(sides) == 1:
+            result[day][carrier][number] = next(iter(sides))
+    return {day: dict(by_carrier) for day, by_carrier in result.items()}
+
+
+def build_gtfs(today: date, horizon=43) -> tuple[dict, dict]:
     with zipfile.ZipFile(io.BytesIO(get(GTFS))) as z:
         agencies = {r.get("agency_id", ""): r.get("agency_name", "") for r in csv_rows(z, "agency.txt")}
         routes = {}
@@ -78,7 +152,7 @@ def build_gtfs(today: date, horizon=43) -> dict[str, dict[str, dict[str, str]]]:
             if not re.fullmatch(r"(?:RE?\d+[A-Z]?|S\d{1,2}|SKM\d{1,2})", line):
                 continue
             agency = agencies.get(row.get("agency_id", ""), "").lower()
-            carrier = "SKM" if "szybka kolej miejska" in agency and "warszaw" in agency else "KM" if "koleje mazowieckie" in agency else ""
+            carrier = "SKM" if ("szybka kolej miejska" in agency or "skm" in agency) and "warszaw" in agency else "KM" if "koleje mazowieckie" in agency else ""
             if carrier:
                 routes[row["route_id"]] = (carrier, line)
 
@@ -101,6 +175,7 @@ def build_gtfs(today: date, horizon=43) -> dict[str, dict[str, dict[str, str]]]:
                     services[service_id].add(d.isoformat())
 
         candidates = defaultdict(set)
+        known_trips = {}
         for trip in csv_rows(z, "trips.txt"):
             route = routes.get(trip.get("route_id", ""))
             if not route:
@@ -109,15 +184,18 @@ def build_gtfs(today: date, horizon=43) -> dict[str, dict[str, dict[str, str]]]:
             if not numbers:
                 continue
             carrier, line = route
+            known_trips[trip["trip_id"]] = (carrier, numbers, trip.get("service_id", ""))
             for day in services.get(trip.get("service_id", ""), ()):
                 for number in numbers:
                     candidates[(day, carrier, number)].add(line)
+
+        directions = train_directions_at_halinow(z, known_trips, services)
 
     result = defaultdict(lambda: defaultdict(dict))
     for (day, carrier, number), lines in candidates.items():
         if len(lines) == 1:
             result[day][carrier][number] = next(iter(lines))
-    return {d: dict(by_carrier) for d, by_carrier in result.items()}
+    return {d: dict(by_carrier) for d, by_carrier in result.items()}, directions
 
 
 def pdf_urls() -> list[str]:
@@ -287,17 +365,18 @@ def build_stock(today: date, horizon=43) -> tuple[dict[str, dict[str, dict]], li
 
 def main():
     today = datetime.now(timezone.utc).date()
-    lines = build_gtfs(today)
+    lines, directions = build_gtfs(today)
     stock, sources = build_stock(today)
     line_count = sum(len(rows) for carriers in lines.values() for rows in carriers.values())
+    direction_count = sum(len(rows) for carriers in directions.values() for rows in carriers.values())
     stock_count = sum(len(rows) for rows in stock.values())
-    print(f"GTFS: {line_count} dated train-line records. KM PDF: {stock_count} dated stock records from {len(sources)} PDFs")
-    if line_count < 100 or stock_count < 50:
+    print(f"GTFS: {line_count} dated train-line records, {direction_count} Halinów directions. KM PDF: {stock_count} dated stock records from {len(sources)} PDFs")
+    if line_count < 100 or direction_count < 50 or stock_count < 50:
         raise RuntimeError("Importer generated too few records; leaving previous JSON untouched")
     payload = {"schema": 1, "generatedAt": datetime.now(timezone.utc).isoformat(),
                "validUntil": (today + timedelta(days=43)).isoformat(),
-               "lines": lines, "stock": stock,
-               "sources": {"lines": GTFS, "stock": sources}}
+               "lines": lines, "directions": directions, "stock": stock,
+               "sources": {"lines": GTFS, "directions": GTFS, "stock": sources}}
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUTPUT.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
