@@ -1,0 +1,43 @@
+"""Offline tests for number, term and stock matching."""
+
+import unittest
+from datetime import date
+
+from update_data import parse_period, stock_name, term_dates, train_numbers
+
+
+class ImporterTests(unittest.TestCase):
+    def setUp(self):
+        self.first = date(2026, 11, 27)
+        self.last = date(2026, 12, 6)
+
+    def term(self, text):
+        return term_dates(text, self.first, self.last, set())
+
+    def test_period(self):
+        self.assertEqual(parse_period('Okres obowiązywania 27.11.2026 - 06.12.2026'), (self.first, self.last))
+        self.assertEqual(parse_period('Okres obowiązywania: 2026-11-27 - 2026-12-06'), (self.first, self.last))
+
+    def test_numbers(self):
+        self.assertEqual(train_numbers('19816/7'), ['19816', '19817'])
+        self.assertEqual(train_numbers('91958/9'), ['91958', '91959'])
+        self.assertEqual(train_numbers('11121'), ['11121'])
+
+    def test_dates_and_weekdays(self):
+        self.assertEqual(self.term('27 XI,4 XII'), {'2026-11-27','2026-12-04'})
+        self.assertEqual(self.term('30 XI-3 XII'), {'2026-11-30','2026-12-01','2026-12-02','2026-12-03'})
+        self.assertEqual(self.term('27 XI-4 XII (D)'), {'2026-11-27','2026-11-30','2026-12-01','2026-12-02','2026-12-03','2026-12-04'})
+        self.assertEqual(self.term('28 XI-6 XII (C)'), {'2026-11-28','2026-11-29','2026-12-05','2026-12-06'})
+        self.assertEqual(self.term('27 XI-5 XII (1-6)'), {'2026-11-27','2026-11-28','2026-11-30','2026-12-01','2026-12-02','2026-12-03','2026-12-04','2026-12-05'})
+        self.assertEqual(self.term('28 XI,5 XII'), {'2026-11-28','2026-12-05'})
+        self.assertEqual(self.term('27 XI-6 XII (Q)'), set())
+
+    def test_stock(self):
+        self.assertEqual(stock_name('EN57ALwKM', '2'), '2 × EN57AL')
+        self.assertEqual(stock_name('EN57AKMw1', '2'), '2 × EN57AKM')
+        self.assertEqual(stock_name('ER160', '2'), '2 × ER160 FLIRT')
+        self.assertEqual(stock_name('EU47, P, B, Bs', '1, 3, 1, 1'), 'EU47 + 5 wagonów piętrowych')
+
+
+if __name__ == '__main__':
+    unittest.main()
