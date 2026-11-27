@@ -266,6 +266,10 @@ def gtfs_station_boards(z: zipfile.ZipFile, trips: dict, trip_lines: dict, servi
         for position, (seq, row, station_id) in enumerate(route):
             if station_id not in stop_names:
                 continue
+            # IC is included only where it has an actual GTFS stop in Miłosna.
+            # It must not flood the other KM/SKM station boards.
+            if trip_carrier == "IC" and station_key(stop_names[station_id]) != station_key("Sulejówek Miłosna"):
+                continue
             events = []
             if position < len(route) - 1:
                 events.append(("departures", route[position + 1][2], "departure_time"))
@@ -324,11 +328,14 @@ def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict, dict]:
     with zipfile.ZipFile(io.BytesIO(get(GTFS))) as z:
         agencies = {r.get("agency_id", ""): r.get("agency_name", "") for r in csv_rows(z, "agency.txt")}
         routes = {}
+        ic_routes = set()
         for row in csv_rows(z, "routes.txt"):
             line = (row.get("route_short_name") or "").strip().upper()
+            agency = agencies.get(row.get("agency_id", ""), "").lower()
+            if line == "IC" and "intercity" in agency:
+                ic_routes.add(row["route_id"])
             if not re.fullmatch(r"(?:RE?\d+[A-Z]?|S\d{1,2}|SKM\d{1,2})", line):
                 continue
-            agency = agencies.get(row.get("agency_id", ""), "").lower()
             carrier = "SKM" if ("szybka kolej miejska" in agency or "skm" in agency) and "warszaw" in agency else "KM" if "koleje mazowieckie" in agency else ""
             if carrier:
                 routes[row["route_id"]] = (carrier, line)
@@ -354,9 +361,12 @@ def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict, dict]:
         candidates = defaultdict(set)
         known_trips = {}
         trip_lines = {}
+        ic_candidates = {}
         for trip in csv_rows(z, "trips.txt"):
             route = routes.get(trip.get("route_id", ""))
             if not route:
+                if trip.get("route_id") in ic_routes and services.get(trip.get("service_id", "")):
+                    ic_candidates[trip["trip_id"]] = trip
                 continue
             numbers = train_numbers(trip.get("plk_train_number") or trip.get("trip_short_name") or "")
             if not numbers:
@@ -368,9 +378,33 @@ def build_gtfs(today: date, horizon=43) -> tuple[dict, dict, dict, dict, dict]:
                 for number in numbers:
                     candidates[(day, carrier, number)].add(line)
 
-        directions = train_directions_at_halinow(z, known_trips, services)
-        paths, stop_names = train_paths(z, known_trips, services)
-        boards = gtfs_station_boards(z, known_trips, trip_lines, services, stop_names, today)
+        # The feed itself decides when temporary IC calls at Sulejówek Miłosna
+        # exist. No hard-coded train numbers or dates, and no extra catalog stations.
+        source_stops = csv_rows(z, "stops.txt")
+        stop_parents = {s["stop_id"]: s.get("parent_station") or s["stop_id"] for s in source_stops}
+        names_all = {s["stop_id"]: s.get("stop_name", "") for s in source_stops}
+        milosna_ids = {sid for sid, name in names_all.items() if station_key(name) == station_key("Sulejówek Miłosna")}
+        milosna_platforms = {sid for sid, parent in stop_parents.items() if parent in milosna_ids}
+        selected_ic = set()
+        for row in csv_rows(z, "stop_times.txt"):
+            if row.get("stop_id") in milosna_platforms and row.get("trip_id") in ic_candidates:
+                selected_ic.add(row["trip_id"])
+        for trip_id in selected_ic:
+            trip = ic_candidates[trip_id]
+            numbers = train_numbers(trip.get("plk_train_number") or trip.get("trip_short_name") or "")
+            if numbers:
+                # The through train 5226/7 is advertised as IC 5227 on this
+                # temporary Warsaw -> Miłosna section (KM public notice).
+                if numbers == ["5226", "5227"]:
+                    numbers = ["5227"]
+                known_trips[trip_id] = ("IC", numbers, trip.get("service_id", ""))
+                trip_lines[trip_id] = "IC"
+
+        regional_trips = {tid: trip for tid, trip in known_trips.items() if trip[0] != "IC"}
+        directions = train_directions_at_halinow(z, regional_trips, services)
+        paths, stop_names = train_paths(z, regional_trips, services)
+        full_names = {sid: names_all.get(sid, "") for sid, parent in stop_parents.items() if sid == parent}
+        boards = gtfs_station_boards(z, known_trips, trip_lines, services, {**full_names, **stop_names}, today)
 
     result = defaultdict(lambda: defaultdict(dict))
     for (day, carrier, number), lines in candidates.items():
@@ -591,3 +625,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
